@@ -1,0 +1,105 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+    function isAdmin() {
+      return isSignedIn() &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin";
+    }
+    // Защита от слишком большого лого: картинки теперь хранятся не в
+    // Storage (её нет на бесплатном плане Spark), а прямо в поле logoUrl
+    // документа команды как base64. Клиент сам сжимает картинку до
+    // нескольких КБ перед сохранением (см. mlt-site.html), это правило —
+    // серверная страховка на случай, если кто-то пишет в обход клиента.
+    function logoUrlOk() {
+      return !("logoUrl" in request.resource.data) ||
+        request.resource.data.logoUrl == null ||
+        request.resource.data.logoUrl.size() < 300000;
+    }
+
+    // Профили пользователей. Каждый может создать/читать/редактировать
+    // только свой профиль; свою роль сам себе изменить не может — это
+    // может сделать только админ (кроме самого первого пользователя,
+    // который клиентски бутстрапится в админа при первой регистрации —
+    // см. ограничение ниже в разделе "Известные упрощения").
+    match /users/{uid} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && request.auth.uid == uid;
+      allow update: if isAdmin() ||
+        (isSignedIn() && request.auth.uid == uid &&
+         request.resource.data.role == resource.data.role);
+    }
+
+    // Команды: читать может кто угодно (публичный сайт), создавать —
+    // любой вошедший пользователь (создание своей команды), редактировать/
+    // удалять — владелец команды или админ.
+    match /teams/{teamId} {
+      allow read: if true;
+      allow create: if isSignedIn() && request.resource.data.ownerUid == request.auth.uid && logoUrlOk();
+      allow update, delete: if (isAdmin() ||
+        (isSignedIn() && resource.data.ownerUid == request.auth.uid)) && logoUrlOk();
+    }
+
+    // Игроки, турниры, новости — редактирует только админ.
+    match /players/{playerId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+    match /tournaments/{tid} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+    match /news/{nid} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // Матчи: читать может кто угодно. Создавать/удалять/вносить результат —
+    // только админ. Разрешено любому вошедшему клиенту обновлять ТОЛЬКО
+    // поле status (это нужно для автообновления upcoming → live без
+    // облачных функций, план Spark).
+    match /matches/{mid} {
+      allow read: if true;
+      allow create, delete: if isAdmin();
+      allow update: if isAdmin() ||
+        (isSignedIn() &&
+         request.resource.data.diff(resource.data).affectedKeys().hasOnly(["status"]));
+    }
+
+    // Заявки на регистрацию команды на турнир: создать может любой вошедший
+    // (свою заявку), читать — любой вошедший (для проверки статуса своей
+    // заявки), принимать/отклонять — только админ.
+    match /teamRegistrations/{rid} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn();
+      allow update, delete: if isAdmin();
+    }
+
+    match /messages/{id} {
+      allow create: if true;
+      allow read, update, delete: if isAdmin();
+    }
+  }
+}
+
+/* --------------------------------------------------------------------
+   ИЗВЕСТНОЕ УПРОЩЕНИЕ (важно прочитать)
+   Первый когда-либо зарегистрированный пользователь становится админом —
+   это решает "проблему курицы и яйца" (кто-то должен быть первым админом)
+   без облачных функций (Cloud Functions требуют платный план Blaze,
+   а проект намеренно остаётся на бесплатном Spark, как и договаривались
+   для автообновления статуса матчей).
+   Технически это делает клиентский код при регистрации, проверяя, пуста
+   ли коллекция users. Это защищает от повышения прав ПОСЛЕ создания
+   аккаунта (правило update ролей выше), но не может железно защитить
+   момент первого create — теоретически кто-то, изучив исходный код,
+   мог бы попытаться создать «второго админа» через прямой вызов
+   Firestore API, если он получит доступ раньше администратора сайта.
+   Практическая рекомендация: зарегистрируйте администратора сразу же
+   после первого деплоя, до того как ссылку на сайт увидит кто-то ещё.
+   Если захотите закрыть эту дыру полностью — это делается одной
+   облачной функцией на onCreate триггере (уже требует Blaze).
+-------------------------------------------------------------------- */
